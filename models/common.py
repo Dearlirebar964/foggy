@@ -1107,3 +1107,204 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+        
+class SPPF_SK(nn.Module):
+    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+        super().__init__()
+        c_ = c1 // 2  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv3 = SKAttention(c2)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+
+    def forward(self, x):
+        x = self.cv1(x)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+            y1 = self.m(x)
+            y2 = self.m(y1)
+            return self.cv3(self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1)))
+
+class SKAttention(nn.Module):
+    # 通道数channel, 卷积核尺度kernels, 降维系数reduction, 分组数group, 降维后的通道数L
+    def __init__(self, channel=512, kernels=[1, 3, 5, 7], reduction=16, group=1, L=32):
+        super().__init__()
+        self.d = max(L, channel // reduction)
+        self.convs = nn.ModuleList([])
+        # 有几个kernels,就有几个尺度, 每个尺度对应的卷积层由Conv-bn-relu实现
+        for k in kernels:
+            self.convs.append(
+                nn.Sequential(OrderedDict([
+                    ('conv', nn.Conv2d(channel, channel, kernel_size=k, padding=k // 2, groups=group)),
+                    ('bn', nn.BatchNorm2d(channel)),
+                    ('relu', nn.ReLU())
+                ]))
+            )
+        self.fc = nn.Linear(channel, self.d)
+        self.fcs = nn.ModuleList([])
+        # 将降维后的通道数L通过K个全连接层得到K个尺度对应的通道描述符表示, 然后基于K个通道描述符计算注意力权重
+        for i in range(len(kernels)):
+            self.fcs.append(nn.Linear(self.d, channel))
+        self.softmax = nn.Softmax(dim=0)
+
+    def forward(self, x):
+        B, C, H, W = x.size()
+        # 存放多尺度的输出
+        conv_outs = []
+        ## Split: 将输入特征x通过K个卷积层得到K个尺度的特征
+        for conv in self.convs:
+            scale = conv(x)
+            conv_outs.append(scale)
+        feats = torch.stack(conv_outs, 0)  # torch.stack()函数用于在新创建的维度上对输入的张量序列进行拼接, (B,C,H,W)-->(K,B,C,H,W), K为尺度数
+
+        ## Fuse: 首先将多尺度的信息进行相加,sum()默认在第一个维度进行求和
+        U = sum(conv_outs)  # (K,B,C,H,W)-->sum-->(B,C,H,W)
+        # 全局平均池化操作: (B,C,H,W)-->mean-->(B,C,H)-->mean-->(B,C)  【mean操作等价于全局平均池化的操作】
+        S = U.mean(-1).mean(-1)
+        # 降低通道数,提高计算效率: (B,C)-->(B,d)
+        Z = self.fc(S)
+
+        # 将紧凑特征Z通过K个全连接层得到K个尺度对应的通道描述符表示, 然后基于K个通道描述符计算注意力权重
+        weights = []
+        for fc in self.fcs:
+            weight = fc(Z)  # 恢复预输入相同的通道数: (B,d)-->(B,C)
+            weights.append(weight.view(B, C, 1, 1))  # (B,C)-->(B,C,1,1)
+        scale_weight = torch.stack(weights, 0)  # 将K个通道描述符在0个维度上拼接: (K,B,C,1,1)
+        scale_weight = self.softmax(scale_weight)  # 在第0个维度上执行softmax,获得每个尺度的权重: (K,B,C,1,1)
+
+        ##  Select
+        V = (scale_weight * feats).sum(
+            0)  # 将每个尺度的权重与对应的特征进行加权求和,第一步是加权，第二步是求和：(K,B,C,1,1) * (K,B,C,H,W) = (K,B,C,H,W)-->sum-->(B,C,H,W)
+        return V
+
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, c1, reduction=16):
+        super(ChannelAttentionModule, self).__init__()
+        mid_channel = c1 // reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.shared_MLP = nn.Sequential(
+            nn.Linear(in_features=c1, out_features=mid_channel),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Linear(in_features=mid_channel, out_features=c1)
+        )
+        self.act = nn.Sigmoid()
+        # self.act=nn.SiLU()
+
+    def forward(self, x):
+        avgout = self.shared_MLP(self.avg_pool(x).view(x.size(0), -1)).unsqueeze(2).unsqueeze(3)
+        maxout = self.shared_MLP(self.max_pool(x).view(x.size(0), -1)).unsqueeze(2).unsqueeze(3)
+        return self.act(avgout + maxout)
+
+
+class SpatialAttentionModule(nn.Module):
+    def __init__(self):
+        super(SpatialAttentionModule, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=7, stride=1, padding=3)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        avgout = torch.mean(x, dim=1, keepdim=True)
+        maxout, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avgout, maxout], dim=1)
+        out = self.act(self.conv2d(out))
+        return out
+
+
+class CBAM(nn.Module):
+    def __init__(self, c1,c2):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttentionModule(c1)
+        self.spatial_attention = SpatialAttentionModule()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+
+# SA注意力机制
+class ShuffleAttention(nn.Module):
+
+    def __init__(self, channels, reduction=16, G=8):
+        super().__init__()
+        self.G = G
+        self.channels = channels
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.gn = nn.GroupNorm(channels // (2 * G), channels // (2 * G))
+        self.cweight = Parameter(torch.zeros(1, channels // (2 * G), 1, 1))
+        self.cbias = Parameter(torch.ones(1, channels // (2 * G), 1, 1))
+        self.sweight = Parameter(torch.zeros(1, channels // (2 * G), 1, 1))
+        self.sbias = Parameter(torch.ones(1, channels // (2 * G), 1, 1))
+        self.sigmoid = nn.Sigmoid()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    @staticmethod
+    def channel_shuffle(x, groups):
+        b, c, h, w = x.shape
+        x = x.reshape(b, groups, -1, h, w)
+        x = x.permute(0, 2, 1, 3, 4)
+
+        # flatten
+        x = x.reshape(b, -1, h, w)
+
+        return x
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        # group into subfeatures
+        x = x.view(b * self.G, -1, h, w)  # bs*G,c//G,h,w
+
+        # channel_split
+        x_0, x_1 = x.chunk(2, dim=1)  # bs*G,c//(2*G),h,w
+
+        # channel attention
+        x_channel = self.avg_pool(x_0)  # bs*G,c//(2*G),1,1
+        x_channel = self.cweight * x_channel + self.cbias  # bs*G,c//(2*G),1,1
+        x_channel = x_0 * self.sigmoid(x_channel)
+
+        # spatial attention
+        x_spatial = self.gn(x_1)  # bs*G,c//(2*G),h,w
+        x_spatial = self.sweight * x_spatial + self.sbias  # bs*G,c//(2*G),h,w
+        x_spatial = x_1 * self.sigmoid(x_spatial)  # bs*G,c//(2*G),h,w
+
+        # concatenate along channel axis
+        out = torch.cat([x_channel, x_spatial], dim=1)  # bs*G,c//G,h,w
+        out = out.contiguous().view(b, -1, h, w)
+
+        # channel shuffle
+        out = self.channel_shuffle(out, 2)
+        return out
+
+
+class DualPathAttention(nn.Module):
+    def __init__(self, channels):
+        super(DualPathAttention, self).__init__()
+        self.gamma1 = nn.Parameter(torch.zeros(1))
+        self.gamma2 = nn.Parameter(torch.zeros(1))
+        self.cbam = CBAM(channels,channels)  # 假设CBAMModule是预先定义的CBAM实现
+        self.self_attention = ShuffleAttention(channels)  # 假设SelfAttentionModule是预先定义的自注意力实现
+        print("DualPathAttention")
+
+    def forward(self, x):
+        # 对CBAM和自注意力的输出应用学习的参数
+        cbam_out = self.cbam(x) * self.gamma1
+        sa_out = self.self_attention(x) * self.gamma2
+
+        # 合并两个注意力路径的结果
+        out = cbam_out + sa_out
+        return out
